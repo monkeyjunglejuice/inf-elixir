@@ -33,6 +33,7 @@
 (require 'comint)
 (require 'subr-x)
 (require 'map)
+(require 'eglot nil t)
 
 
 ;;; Customization
@@ -76,6 +77,14 @@ NOTE: Changing this variable will not affect running REPLs."
   :type 'boolean
   :group 'inf-elixir)
 
+(defcustom inf-elixir-use-eglot-completions t
+  "Whether to offer eglot-backed completions in inf-elixir REPL buffers.
+
+Completions are only attempted when `eglot' is available and the REPL is
+attached to a Mix project."
+  :type 'boolean
+  :group 'inf-elixir)
+
 
 ;;; Mode definitions and configuration
 (defvar inf-elixir-repl-buffer nil
@@ -93,6 +102,9 @@ printed instead.")
 (defvar inf-elixir-unaffiliated-buffers '()
   "A list of Elixir REPL buffers unaffiliated with any project.")
 
+(defvar inf-elixir--eglot-proxy-buffers (make-hash-table :test 'equal)
+  "Scratch buffers used to proxy eglot completions per project.")
+
 ;;;###autoload
 (define-minor-mode inf-elixir-minor-mode
   "Minor mode for Elixir buffers that allows interacting with the REPL.")
@@ -100,7 +112,8 @@ printed instead.")
 ;;;###autoload
 (define-derived-mode inf-elixir-mode comint-mode "Inf-Elixir"
   "Major mode for interacting with an Elixir REPL."
-  (setq-local comint-prompt-read-only t))
+  (setq-local comint-prompt-read-only t)
+  (inf-elixir--setup-repl-completion))
 
 
 ;;; Private functions
@@ -152,7 +165,7 @@ printed instead.")
     (when (and
            proc
            (yes-or-no-p
-                (concat "An Elixir REPL is already running in " name ". Kill it? ")))
+            (concat "An Elixir REPL is already running in " name ". Kill it? ")))
       (delete-process proc))))
 
 (defun inf-elixir--maybe-clear-repl (dir)
@@ -227,9 +240,9 @@ the buffer so that the choice is remembered for that buffer."
          '(hash-table :test equal)))
   ;; Actual functionality
   (let* ((repl-buffers (append
-                       '("Create new")
-                       (mapcar (lambda (buf) `(,(buffer-name buf) . buf)) inf-elixir-unaffiliated-buffers)
-                       (mapcar (lambda (buf) `(,(buffer-name buf) . buf)) (hash-table-values inf-elixir-project-buffers))))
+                        '("Create new")
+                        (mapcar (lambda (buf) `(,(buffer-name buf) . buf)) inf-elixir-unaffiliated-buffers)
+                        (mapcar (lambda (buf) `(,(buffer-name buf) . buf)) (hash-table-values inf-elixir-project-buffers))))
          (prompt (or prompt "Which REPL?"))
          (selected-buf (completing-read prompt repl-buffers (lambda (_) t) t)))
     (setq-local inf-elixir-repl-buffer (if (equal selected-buf "Create new")
@@ -248,6 +261,109 @@ the buffer so that the choice is remembered for that buffer."
             (while (search-forward-regexp regexp nil t 1)
               (push (match-string 1) matches)))))
       matches)))
+
+
+;;; Eglot-backed completion
+
+(defun inf-elixir--eglot-available-p ()
+  "Return non-nil when eglot-backed completions are usable."
+  (and inf-elixir-use-eglot-completions
+       (featurep 'eglot)
+       (fboundp 'eglot-ensure)))
+
+(defun inf-elixir--eglot--project-proxy (proj-dir)
+  "Return the eglot proxy buffer for PROJ-DIR, creating it if needed."
+  (when proj-dir
+    (let ((buf (gethash proj-dir inf-elixir--eglot-proxy-buffers)))
+      (if (buffer-live-p buf)
+          buf
+        (let* ((name (format "*inf-elixir-eglot %s*" (inf-elixir--project-name proj-dir)))
+               (new (generate-new-buffer name)))
+          (with-current-buffer new
+            (setq default-directory proj-dir)
+            (setq-local buffer-read-only nil)
+            (setq-local buffer-file-name (expand-file-name ".inf-elixir-eglot.exs" proj-dir))
+            (when (fboundp 'elixir-ts-mode) (elixir-ts-mode)))
+          (puthash proj-dir new inf-elixir--eglot-proxy-buffers)
+          new)))))
+
+(defun inf-elixir--eglot--ensure-managed (proj-dir)
+  "Ensure eglot is managing the proxy buffer for PROJ-DIR."
+  (when-let* ((buf (inf-elixir--eglot--project-proxy proj-dir))
+              (_server-available (inf-elixir--eglot-available-p)))
+    (with-current-buffer buf
+      (setq default-directory proj-dir)
+      (let ((mode-ready (or (derived-mode-p 'elixir-ts-mode)
+                            (when (fboundp 'elixir-ts-mode)
+                              (elixir-ts-mode)
+                              t))))
+        (if (not mode-ready)
+            (progn
+              (message "inf-elixir: elixir-ts-mode not available for eglot completions")
+              nil)
+          (condition-case err
+              (progn
+                (eglot-ensure)
+                (eglot-managed-p))
+            (error
+             (message "inf-elixir: eglot setup failed: %s" (error-message-string err))
+             nil)))))))
+
+(defun inf-elixir--eglot--capf (proj-dir line-text column)
+  "Ask eglot for a completion source in PROJ-DIR given LINE-TEXT at COLUMN."
+  (when (inf-elixir--eglot--ensure-managed proj-dir)
+    (with-current-buffer (inf-elixir--eglot--project-proxy proj-dir)
+      (let ((inhibit-read-only t)
+            (completion-at-point-functions '(eglot-completion-at-point)))
+        (erase-buffer)
+        (insert line-text)
+        (goto-char (min (1+ column) (1+ (buffer-size))))
+        (when-let ((capf (run-hook-with-args-until-success 'completion-at-point-functions)))
+          (cons (current-buffer) capf))))))
+
+(defun inf-elixir--eglot--proxy-value (value buf)
+  "If VALUE is callable, proxy its execution into BUF."
+  (if (functionp value)
+      (lambda (&rest args)
+        (with-current-buffer buf
+          (apply value args)))
+    value))
+
+(defun inf-elixir--eglot--proxy-plist (plist buf)
+  "Proxy callable PLIST values so they execute inside BUF."
+  (let (acc)
+    (while plist
+      (let ((key (pop plist))
+            (val (pop plist)))
+        (setq acc (cons (inf-elixir--eglot--proxy-value val buf) acc))
+        (setq acc (cons key acc))))
+    (nreverse acc)))
+
+(defun inf-elixir-eglot-completion-at-point ()
+  "Completion-at-point function that proxies eglot results into the REPL."
+  (when-let* ((proj-dir (inf-elixir--find-project-root))
+              (input-start (if (fboundp 'comint-line-beginning-position)
+                               (comint-line-beginning-position)
+                             (line-beginning-position)))
+              (line-text (buffer-substring-no-properties input-start (line-end-position)))
+              (column (min (- (point) input-start) (length line-text)))
+              (capf (inf-elixir--eglot--capf proj-dir line-text column)))
+    (pcase-let* ((`(,proxy-buf . ,capf-result) capf)
+                 (`(,beg ,end ,table . ,plist) capf-result))
+      (let* ((start (+ input-start (1- beg)))
+             (finish (+ input-start (1- end)))
+             (table (if (functionp table)
+                        (lambda (string pred action)
+                          (with-current-buffer proxy-buf
+                            (funcall table string pred action)))
+                      table))
+             (plist (inf-elixir--eglot--proxy-plist plist proxy-buf)))
+        (apply #'list start finish table plist)))))
+
+(defun inf-elixir--setup-repl-completion ()
+  "Register eglot-backed completion when available."
+  (when (inf-elixir--eglot-available-p)
+    (add-hook 'completion-at-point-functions #'inf-elixir-eglot-completion-at-point nil t)))
 
 
 ;;; Public functions
