@@ -69,12 +69,12 @@ An example of keybindings is included in the `use-package` declaration above.
 
 ## Completion (WIP)
 
-Completion uses completion-at-point
+Completion works with the Completions buffer, Consult and Corfu.
 
 1. `inf-elixir` can offer completions directly in the REPL buffer. By default it
 asks Eglot (when available and connected to a project).
 
-2. To ask the running IEx process for completions instead, set the custom variable `inf-elixir-completion-provider` to `iex` (or to `nil` to disable completion integration entirely) -- not implemented yet.
+2. WIP: To ask the running IEx process for completions, set the custom variable `inf-elixir-completion-provider` to `iex` (or to `nil` to disable completion integration entirely).
 
 [badge-license]: https://img.shields.io/badge/license-GPL_3-green.svg
 
