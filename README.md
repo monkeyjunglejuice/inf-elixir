@@ -11,6 +11,10 @@ This is a package to allow you to pop open and interact with Elixir REPL (IEx, p
 - [x] Run IEx in a project setting (`inf-elixir-project`)
 - [x] Ability to send commands to the inf buffer from a code file (`inf-elixir-send-line`, `inf-elixir-send-region`, `inf-elixir-send-buffer`)
 
+## Work in progress
+- [x] Completion candidates provided by Eglot works, but is a bit slow for "live" auto-completion via Corfu (fine for TAB-completion though). Doesn't insert whole snippets.
+- [ ] Completion directly by IEx, without language server.
+
 ## TODO
 - [ ] Got a feature you want to see? Open an issue! :smile:
 
@@ -62,6 +66,15 @@ Once your installation is configured to use MELPA, `inf-elixir` can be installed
 - `inf-elixir-reload-module` :: Reload modules from current buffer using `IEx.Helpers.r/1`.
 
 An example of keybindings is included in the `use-package` declaration above.
+
+## Completion (WIP)
+
+Completion uses completion-at-point
+
+1. `inf-elixir` can offer completions directly in the REPL buffer. By default it
+asks Eglot (when available and connected to a project).
+
+2. To ask the running IEx process for completions instead, set the custom variable `inf-elixir-completion-provider` to `iex` (or to `nil` to disable completion integration entirely) -- not implemented yet.
 
 [badge-license]: https://img.shields.io/badge/license-GPL_3-green.svg
 
